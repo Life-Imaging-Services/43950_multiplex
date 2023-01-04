@@ -8,10 +8,32 @@ import digitalio
 DEBUG = False
 
 PKTLEN = const(5) # packet length
-GSTAT = const(0x01)
-GCONF = const(0x00)
+
+GSTAT = const(0x01)  # Global status flags
+GCONF = const(0x00)  # General Configuration Registers
+SLAVECONF = const(0x03)  # 11..8 SENDDELAY | 7..0 UART SLAVEADDR
+IOIN = const(0x04)  # Reads the state of all input pins available
+    # 0 REFL_STEP | 1 REFR_DIR | 2 ENCB_DCEN_CFG4 | 3 ENCA_DCIN_CFG5 | 4 DRV_ENN_CFG6 | 5 ENC_N_DCO
+    # 6 SD_MODE (1=External step and dir source) | 7 SWCOMP_IN (Shows voltage difference of SWN and SWP. Bring DIAG
+        # outputs to high level with pushpull disabled to test the comparator.)
+    # 31..24 VERSION: 0x11=first version of the IC. Identical numbers mean full digital compatibility.
+OUTPUT = const(0x04) # NAO output for UART configuration (see manual)
+X_COMPARE = const(0x05)  # Position comparison register for motion controller position strobe.
+    # The Position pulse is available on output SWP_DIAG1
 CHOPCONF = const(0x6C)
-IHOLD_IRUN = const(0x10)
+IHOLD_IRUN = const(0x10)  # b19..16 IHOLDDELAY | b12..0 IRUN | b4..0 IHOLD
+    # IHOLDDELAY Controls the number of clock cycles for motor power down after a motion as soon as standstill is
+    # detected (stst=1) and TPOWERDOWN has expired. The smooth transition avoids a motor jerk upon power down.
+        # 0: instant power down
+        # 1..15: Delay per current reduction step in multiple of 2^18 clocks
+    # IRUN Motor run current (0=1/32…31=32/32)
+    # IHOLD Standstill current (0=1/32…31=32/32)
+    #In combination with StealthChop mode, setting IHOLD=0 allows to choose freewheeling
+    # or coil short circuit for motor stand still.
+TPOWERDOWN = const(0x11)  # 8b TPOWERDOWN sets the delay time after stand still (stst) of the motor to motor current
+    # power down. Time range is about 0 to 4 seconds.
+        #0: no delay, 1: minimum delay,
+        #2..255: (TPOWERDOWN-1) * 2^18 tCLK
 TPWMTHRS = const(0x13)  # upper velocity limit for StealthChop
 RAMPMODE = const(0x20)  # 0: Position, 1: Right Turn, 2: Left Turn
 XACTUAL = const(0x21)
@@ -24,9 +46,14 @@ VMAX = const(0x27)
 DMAX = const(0x28)  # Deceleration VMAX->V1
 D1 = const(0x2A)  # Deceleration V1->VSTOP
 VSTOP = const(0x2B)  # > VSTART, Default 10
-TZEROWAIT = const(0x2C)
-XTARGET = const(0x2D)
-
+TZEROWAIT = const(0x2C)  # 16b Defines the waiting time after ramping down to zero velocity before next movement or
+    # direction inversion can start. Time range is about 0 to 2 seconds.
+XTARGET = const(0x2D)  # 32b Target position for ramp mode (signed). Write a new target position to this register in order
+    # to activate the ramp generator positioning in RAMPMODE=0.
+    # Initialize all velocity, acceleration and deceleration parameters before.
+SW_MODE = const(0x34)  # Reference Switch & StallGuard2 Event Configuration Register
+RAMP_STAT = const(0x35)  # Ramp & Reference Switch Status Register
+XLATCH = const(0x36)  # 32b Ramp generator latch position, latches XACTUAL upon a programmable switch event (see SW_MODE).
 
 class Motor:
     """
@@ -34,7 +61,7 @@ class Motor:
     """
 
 
-    def __init__(self, spi, chip_select, baudrate=100000):
+    def __init__(self, spi, chip_select, gconf, ihold_irun, num_of_motors=1, motor_num=0, baudrate=100_000):
         """
         :param spi: busio.SPI object
         :param chip_select: digitalio.DigitalInOut object
@@ -44,6 +71,8 @@ class Motor:
         self.spi = spi
         self.cs = chip_select
         self.cs.switch_to_output(True)  # initialize chipselect pin
+        self.num_of_motors = num_of_motors
+        self.motor_num = motor_num
         self.baudrate = baudrate
         self.Status = None
         self.Pos = None
@@ -52,9 +81,9 @@ class Motor:
 
         with self:
             self.reg(GSTAT)  # read GSTAT 0x01 to clear reset flag
-            self.reg(GCONF, 0x04)
+            self.reg(GCONF, gconf)
             self.reg(CHOPCONF, 0x000100C5)  # TOFF=3, HSTRT=4, HEND=1, TBL=2, CHM=0 (spreadCycle)
-            self.reg(IHOLD_IRUN, 0x011704)  # IHOLD=0x04, IRUN=0x17 (max. current), IHOLDDELAY=6
+            self.reg(IHOLD_IRUN, ihold_irun)  # IHOLDDELAY=1, IRUN=4/32 of max, IHOLD=2/32 of max
             self.reg(TPWMTHRS, 0) # upper velocity for StealthChop)
             self.reg(A1, 1000)
             self.reg(V1, 5000)
@@ -97,18 +126,18 @@ class Motor:
             f = '>Bl'  # format string for signed long
         else:
             f = '>BL'  # format string for unsigned long
+        outbuf = bytearray(b'\x00' * 5 * self.num_of_motors)
         if val is None:
             #print("read", hex(regnum))
-            outbuf = struct.pack(f, regnum, 0)
+            struct.pack_into(f, outbuf, self.motor_num * 5, regnum, 0)
         else:
             #print("write", hex(regnum | 0x80), hex(val))
-            outbuf = struct.pack(f, regnum | 0x80, val)
+            struct.pack_into(f, outbuf, self.motor_num * 5, regnum | 0x80, val)
         inbuf = bytearray(len(outbuf))
         self.write_read(outbuf, inbuf)  # read
-        outbuf2 = struct.pack(f, regnum, 0)
-        inbuf = bytearray(len(outbuf))
-        self.write_read(outbuf2, inbuf)  # read
-        self.Status, v = struct.unpack(f, inbuf)
+        struct.pack_into(f, outbuf, self.motor_num * 5, regnum, 0)
+        self.write_read(outbuf, inbuf)  # read
+        self.Status, v = struct.unpack_from(f, inbuf, self.motor_num * 5)
         if val is None: val=0  # *******************9
         if DEBUG:print(f'{regnum:02X},    {val:8X}, {self.Status:08b}, {v:8X} {repr(v==val):7} {repr(outbuf):28} {repr(bytes(inbuf)):28}')  # *******************
         return v

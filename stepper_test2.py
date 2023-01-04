@@ -1,5 +1,5 @@
 '''
-checking a single mmplex stepper board via SPI
+checking several mmplex stepper boards concatenated via SPI
 '''
 
 import time
@@ -10,13 +10,15 @@ import lis_circuitpython_tmc5130 as tmc
 
 import keyboard
 
+NUM_OF_STEPPERS = 3  # the number of concatenatede steppers
+
 print(dir(board))
 
 spi = board.SPI()
 cs = digitalio.DigitalInOut(board.D5)
 
 
-m = tmc.Motor(spi,chip_select=cs, gconf=0b110, ihold_irun=0x01_04_00, num_of_motors=3, motor_num=1, baudrate=500_000)
+m = tmc.Motor(spi,chip_select=cs,baudrate=100000)
 time.sleep(0.1)
 
 # set motor currents
