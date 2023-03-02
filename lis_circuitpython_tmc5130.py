@@ -1,9 +1,5 @@
 from micropython import const
 import struct
-import time
-import busio
-import board
-import digitalio
 
 DEBUG = False
 
@@ -61,27 +57,40 @@ class Motor:
     """
 
 
-    def __init__(self, spi, chip_select, gconf, ihold_irun, num_of_motors=1, motor_num=0, baudrate=100_000):
+    def __init__(self, spi, chip_select, gconf, ihold_irun, num_of_motors=1, motor_num=0, phase=1, polarity=1, baudrate=100_000):
         """
         :param spi: busio.SPI object
         :param chip_select: digitalio.DigitalInOut object
         :param baudrate:
         initializes the TMC5130 according to the datasheet example for positioning
         """
+        assert 1 <= num_of_motors <= 4
+        assert 0 <= motor_num <= num_of_motors-1
         self.spi = spi
         self.cs = chip_select
-        self.cs.switch_to_output(True)  # initialize chipselect pin
+        if self.cs:
+            self.cs.switch_to_output(True)  # initialize chipselect pin
         self.num_of_motors = num_of_motors
         self.motor_num = motor_num
+        self.phase = phase
+        self.polarity = polarity
         self.baudrate = baudrate
         self.Status = None
         self.Pos = None
         self.TargetPos = None
+        self.outbuf = bytearray(b'\x00' * 5 * num_of_motors)
+        self.inbuf = bytearray(b'\x00' * 5 * num_of_motors)
+        self.error = True
 
 
         with self:
             self.reg(GSTAT)  # read GSTAT 0x01 to clear reset flag
-            self.reg(GCONF, gconf)
+            if self.reg(GCONF, gconf) == gconf:
+                self.error = False
+            else:
+                raise ConnectionError('TMC5130 not connected')
+                #self.error = 'TMC5130 not connected'
+
             self.reg(CHOPCONF, 0x000100C5)  # TOFF=3, HSTRT=4, HEND=1, TBL=2, CHM=0 (spreadCycle)
             self.reg(IHOLD_IRUN, ihold_irun)  # IHOLDDELAY=1, IRUN=4/32 of max, IHOLD=2/32 of max
             self.reg(TPWMTHRS, 0) # upper velocity for StealthChop)
@@ -99,7 +108,7 @@ class Motor:
             pass
         while self.spi.try_lock():
             pass
-        self.spi.configure(phase=1, polarity=1, baudrate=self.baudrate)
+        self.spi.configure(phase=self.phase, polarity=self.polarity, baudrate=self.baudrate)
 
         return self
 
@@ -108,9 +117,10 @@ class Motor:
         self.spi.unlock()
 
     def write_read(self,outbuf, inbuf):
-        self.cs.value = False
+        if self.cs: self.cs.value = False
+        if DEBUG: print("DEBUG: cmd=self.spi.write_readinto(outbuf, inbuf)", " outbuf=", outbuf, " inbuf=", inbuf)
         self.spi.write_readinto(outbuf, inbuf)  # read
-        self.cs.value = True
+        if self.cs: self.cs.value = True
 
     def reg(self,
             regnum,
@@ -126,20 +136,18 @@ class Motor:
             f = '>Bl'  # format string for signed long
         else:
             f = '>BL'  # format string for unsigned long
-        outbuf = bytearray(b'\x00' * 5 * self.num_of_motors)
         if val is None:
             #print("read", hex(regnum))
-            struct.pack_into(f, outbuf, self.motor_num * 5, regnum, 0)
+            struct.pack_into(f, self.outbuf, self.motor_num * 5, regnum, 0)
         else:
             #print("write", hex(regnum | 0x80), hex(val))
-            struct.pack_into(f, outbuf, self.motor_num * 5, regnum | 0x80, val)
-        inbuf = bytearray(len(outbuf))
-        self.write_read(outbuf, inbuf)  # read
-        struct.pack_into(f, outbuf, self.motor_num * 5, regnum, 0)
-        self.write_read(outbuf, inbuf)  # read
-        self.Status, v = struct.unpack_from(f, inbuf, self.motor_num * 5)
+            struct.pack_into(f, self.outbuf, self.motor_num * 5, regnum | 0x80, val)
+        self.write_read(self.outbuf, self.inbuf)  # read
+        struct.pack_into(f, self.outbuf, self.motor_num * 5, regnum, 0)
+        self.write_read(self.outbuf, self.inbuf)  # read
+        self.Status, v = struct.unpack_from(f, self.inbuf, self.motor_num * 5)
         if val is None: val=0  # *******************9
-        if DEBUG:print(f'{regnum:02X},    {val:8X}, {self.Status:08b}, {v:8X} {repr(v==val):7} {repr(outbuf):28} {repr(bytes(inbuf)):28}')  # *******************
+        if DEBUG:print(f'{regnum:02X},    {val:8X}, {self.Status:08b}, {v:8X} {repr(v==val):7} {repr(self.outbuf):28} {repr(bytes(self.inbuf)):28}')  # *******************
         return v
 
 
@@ -237,6 +245,20 @@ class Motor:
         """
         self.reg(XACTUAL)
         return self.Status
+
+    def switch_left(self):
+        """ updates self.Status with the current status byte
+            returns True if the motor is stopped
+        """
+        self.reg(XACTUAL)  # some read command to update the status
+        return ((self.Status & 0b0100_0000) > 0)
+
+    def switch_right(self):
+        """ updates self.Status with the current status byte
+            returns True if the motor is stopped
+        """
+        self.reg(XACTUAL)  # some read command to update the status
+        return ((self.Status & 0b1000_0000) > 0)
 
     def stopped(self):
         """ updates self.Status with the current status byte
